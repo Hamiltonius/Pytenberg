@@ -1,0 +1,21 @@
+paths:
+  drop: "./drop"
+  out: "./out"
+  logs: "./logs"
+  refs: "./refs"
+
+active_pattern: "invoice"
+
+refs:
+  - name: "README_TEMPLATE.txt"
+    content: |
+      This folder was created by pytenberg.
+      - Place working files here
+      - Original email saved to archive/
+      - Attachments saved alongside this file
+
+subjects:
+  - "Invoice: INV-2025-101 from Acme Industries"
+  - "Contract: MSA-2025-Q1 Renewal Package"
+  - "Northrop Grumman - Engineering Drawings Review"
+  - "Component inspection report: 7A9B2C4D5E"
