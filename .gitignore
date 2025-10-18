@@ -5,3 +5,4 @@ logs/
 reports/
 *.msg
 **/.DS_Store
+out/*
