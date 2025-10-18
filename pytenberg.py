@@ -4,11 +4,11 @@ Pytenberg - Email to Project Automation
 Turns inbox chaos into organized folder structures.
 
 Author: Thomas Galarneau
-Version: 1.0.1
+Version: 1.0.0
 License: MIT
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.0"
 __author__ = "Thomas Galarneau"
 
 import os
@@ -38,8 +38,8 @@ LOGS_FOLDER = SCRIPT_DIR / "logs"
 # Regex to remove prefixes like "Re:" or "Fwd:" before matching
 SUBJECT_PREFIX_RE = re.compile(r'(?i)^(?:re|fwd?|aw|sv)\s*:\s*')
 
-# Regex pattern presets for various subject styles
-PATTERNS = {
+# Regex variant presets for various subject styles
+VARIANTS = {
     "invoice": r"(?i)(invoice|inv)[:\s#-]*([A-Z0-9-]+)",
     "project": r"(?i)(project|proj)[:\s#-]*([A-Z0-9-]+)",
     "client": r"(?i)(client|customer)[:\s#-]*([A-Za-z0-9\s]+?)(?=\s*[-:]|\s*$)",
@@ -50,13 +50,13 @@ PATTERNS = {
     "proposal": r"(?i)(proposal|rfp)[:\s#-]*([A-Z0-9-]+)",
     "homework": r"(?i)(hw|homework|assignment)[:\s#-]*(\d+|[A-Z]+\d+)",
     "class": r"(?i)(class|course)[:\s#-]*([A-Z]{2,4}\s?\d{3,4})",
-    "whole_subject_extract": r"(?i)^([A-Za-z0-9&'().\s]+?)(?=\s*[-:])",
+    "default": r"(?i)^([A-Za-z0-9&'().\s]+?)(?=\s*[-:])",
     "aerospace_code": r"(?<![A-Za-z0-9])[0-9][A-Za-z0-9]{9}(?![A-Za-z0-9])",
     "generic": r"[\[\(]([A-Za-z0-9\-_\s]+)[\]\)]|:\s*([A-Za-z0-9\-_]+)"
 }
 
-# Select active pattern
-ACTIVE_PATTERN = "invoice"  # e.g., "whole_subject_extract" or "aerospace_code"
+# Select active variant
+ACTIVE_VARIANT = "default"  # e.g., "whole_subject_extract" or "aerospace_code"
 
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
@@ -92,13 +92,13 @@ def clean_subject(subject: Optional[str]) -> str:
     return s
 
 
-def extract_project_code(subject: str, pattern: str) -> Optional[str]:
+def extract_project_code(subject: str, variant: str) -> Optional[str]:
     """
-    Extract a project or identifier code from an email subject using a regex pattern.
+    Extract a project or identifier code from an email subject using a regex variant.
     Returns a sanitized string safe for folder names, or None if no match.
     """
     subj = clean_subject(subject)
-    match = re.search(pattern, subj)
+    match = re.search(variant, subj)
     if not match:
         return None
 
@@ -112,7 +112,7 @@ def extract_project_code(subject: str, pattern: str) -> Optional[str]:
 # -----------------------------------------------------------------------------
 # CORE PROCESS
 # -----------------------------------------------------------------------------
-def process_msg_file(msg_path: Path, pattern: str) -> bool:
+def process_msg_file(msg_path: Path, variant: str) -> bool:
     """
     Process a single .msg file:
       - Extract project code
@@ -125,7 +125,7 @@ def process_msg_file(msg_path: Path, pattern: str) -> bool:
     try:
         msg = extract_msg.Message(str(msg_path))
         subject = msg.subject or "No Subject"
-        project_code = extract_project_code(subject, pattern)
+        project_code = extract_project_code(subject, variant)
 
         if not project_code:
             print(f"⚠️  No match in: {subject}")
@@ -185,15 +185,15 @@ def main():
     for folder in [DROP_FOLDER, OUT_FOLDER, REFS_FOLDER, LOGS_FOLDER]:
         folder.mkdir(exist_ok=True)
 
-    pattern = PATTERNS.get(ACTIVE_PATTERN)
-    if not pattern:
-        print(f"Pattern '{ACTIVE_PATTERN}' not found in PATTERNS.")
+    variant = VARIANTS.get(ACTIVE_VARIANT)
+    if not variant:
+        print(f"Variant '{ACTIVE_VARIANT}' not found in VARIANTS: {list(VARIANTS.keys())}")
         return
 
     print(f"{'='*60}")
     print(f"Pytenberg v{__version__}")
     print(f"{'='*60}")
-    print(f"Active pattern: {ACTIVE_PATTERN}")
+    print(f"Active variant: {ACTIVE_VARIANT}")
     print(f"Drop folder:    {DROP_FOLDER}")
     print(f"Output folder:  {OUT_FOLDER}")
     print(f"{'='*60}\n")
@@ -201,13 +201,13 @@ def main():
     msg_files = list(DROP_FOLDER.glob("*.msg"))
     if not msg_files:
         print("No .msg files found in drop/ folder.")
-        print("\n💡 Example: save a test email with a subject that fits your pattern.")
+        print("\n💡 Example: save a test email with a subject that fits your variant.")
         print("   Drop it into 'drop/' and rerun this script.")
         return
 
     processed = failed = 0
     for msg_file in msg_files:
-        if process_msg_file(msg_file, pattern):
+        if process_msg_file(msg_file, variant):
             processed += 1
         else:
             failed += 1
