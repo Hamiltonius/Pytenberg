@@ -56,18 +56,6 @@ Drop recurring reference files here once — templates, checklists, or forms you
 
 ---
 
-## Example Commands
-```bash
-# Local Outlook messages
-python3 pytenberg.py --source local
-
-# Gmail (read-only, filtered by subject)
-python3 pytenberg.py --source gmail --subject invoice
-
-# Gmail (filtered by sender)
-python3 pytenberg.py --source gmail --from amazon.com --screenshot
-```
-
 ## Troubleshooting
 
 | Issue                         | Fix                                                                                |
