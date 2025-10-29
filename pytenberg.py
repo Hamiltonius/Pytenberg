@@ -1,223 +1,241 @@
 #!/usr/bin/env python3
 """
-Pytenberg - Email to Project Automation
-Turns inbox chaos into organized folder structures.
+Pytenberg — Gmail → Folders (standalone)
+- OAuth to Gmail (readonly)
+- Subject query (prompt or --query)
+- Spam excluded, safe attachment types, size cap
+- Dry-run + idempotency (gmail_ledger.jsonl)
 
 Author: Thomas Galarneau
-Version: 1.0.0
 License: MIT
 """
 
-__version__ = "1.0.0"
-__author__ = "Thomas Galarneau"
-
-import os
-import sys
-import shutil
-import re
-import unicodedata
+import os, re, json, base64, argparse, datetime as dt
 from pathlib import Path
-from typing import Optional
 
-try:
-    import extract_msg
-except ImportError:
-    print("Error: extract_msg library not found.")
-    print("Install with: pip install extract-msg")
-    sys.exit(1)
+# ---- Google API ----
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION
-# -----------------------------------------------------------------------------
-SCRIPT_DIR = Path(__file__).parent
-DROP_FOLDER = SCRIPT_DIR / "drop"
-OUT_FOLDER = SCRIPT_DIR / "out"
-REFS_FOLDER = SCRIPT_DIR / "refs"
-LOGS_FOLDER = SCRIPT_DIR / "logs"
+# ---- Paths/Config (standalone) ----
+SCRIPT_DIR  = Path(__file__).parent
+OUT_ROOT    = SCRIPT_DIR / "pytenberg_output"
+LOGS_DIR    = SCRIPT_DIR / "logs"
+LEDGER_FILE = LOGS_DIR / "gmail_ledger.jsonl"   # idempotency (by Gmail msg id)
 
-# Regex to remove prefixes like "Re:" or "Fwd:" before matching
-SUBJECT_PREFIX_RE = re.compile(r'(?i)^(?:re|fwd?|aw|sv)\s*:\s*')
+SAFE_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".csv"}
+MAX_BYTES = 25 * 1024 * 1024  # 25 MB cap per attachment
 
-# Regex variant presets for various subject styles
-VARIANTS = {
-    "invoice": r"(?i)(invoice|inv)[:\s#-]*([A-Z0-9-]+)",
-    "project": r"(?i)(project|proj)[:\s#-]*([A-Z0-9-]+)",
-    "client": r"(?i)(client|customer)[:\s#-]*([A-Za-z0-9\s]+?)(?=\s*[-:]|\s*$)",
-    "case": r"(?i)(case|ticket)[:\s#-]*([A-Z0-9-]+)",
-    "order": r"(?i)(order|po)[:\s#-]*([A-Z0-9-]+)",
-    "contract": r"(?i)(contract|agreement)[:\s#-]*([A-Z0-9-]+)",
-    "quote": r"(?i)(quote|rfq)[:\s#-]*([A-Z0-9-]+)",
-    "proposal": r"(?i)(proposal|rfp)[:\s#-]*([A-Z0-9-]+)",
-    "homework": r"(?i)(hw|homework|assignment)[:\s#-]*(\d+|[A-Z]+\d+)",
-    "class": r"(?i)(class|course)[:\s#-]*([A-Z]{2,4}\s?\d{3,4})",
-    "default": r"(?i)^([A-Za-z0-9&'().\s]+?)(?=\s*[-:])",
-    "aerospace_code": r"(?<![A-Za-z0-9])[0-9][A-Za-z0-9]{9}(?![A-Za-z0-9])",
-    "generic": r"[\[\(]([A-Za-z0-9\-_\s]+)[\]\)]|:\s*([A-Za-z0-9\-_]+)"
-}
+# ----------------- helpers -----------------
+def banner():
+    print("\n" + "="*70)
+    print("🛡️  SECURITY FEATURES ENABLED")
+    print("="*70)
+    print("• Spam excluded (query enforces -in:spam)")
+    print(f"• Safe attachment types only: {', '.join(sorted(SAFE_EXT))}")
+    print("• Oversized attachments blocked")
+    print("• Dry-run available (--dry-run)")
+    print("="*70 + "\n")
 
-# Select active variant
-ACTIVE_VARIANT = "default"  # e.g., "whole_subject_extract" or "aerospace_code"
-
-# -----------------------------------------------------------------------------
-# HELPER FUNCTIONS
-# -----------------------------------------------------------------------------
 def sanitize_filename(name: str) -> str:
-    """Ensure a filename is safe across all operating systems."""
-    if not name:
-        return "attachment.bin"
-    name = unicodedata.normalize("NFKC", name)
-    name = ''.join('_' if (ord(c) < 32 or c in '<>:"/\\|?*') else c for c in name)
-    name = name.replace('\x00', '').replace('\n', '').replace('\r', '')
-    name = name.strip().strip('_').strip('.')
+    if not name: return "attachment.bin"
+    name = name.replace("\x00", "")
+    name = re.sub(r'[<>:\"/\\|?*\n\r\t]', "_", name).strip().strip(".")
     return name or "attachment.bin"
 
-
-def dedupe_path(filepath: Path) -> Path:
-    """Return a unique filepath by appending (1), (2), etc., if file exists."""
-    if not filepath.exists():
-        return filepath
-    stem, suffix, parent = filepath.stem, filepath.suffix, filepath.parent
-    counter = 1
-    while True:
-        new_path = parent / f"{stem} ({counter}){suffix}"
-        if not new_path.exists():
-            return new_path
-        counter += 1
-
-
-def clean_subject(subject: Optional[str]) -> str:
-    """Strip prefixes and whitespace from an email subject line."""
-    s = (subject or "No Subject").strip()
-    s = SUBJECT_PREFIX_RE.sub("", s)
-    return s
-
-
-def extract_project_code(subject: str, variant: str) -> Optional[str]:
-    """
-    Extract a project or identifier code from an email subject using a regex variant.
-    Returns a sanitized string safe for folder names, or None if no match.
-    """
-    subj = clean_subject(subject)
-    match = re.search(variant, subj)
-    if not match:
-        return None
-
-    groups = [g for g in match.groups() if g]
-    if not groups:
-        return None
-
-    return sanitize_filename(groups[-1]).replace(" ", "_")
-
-
-# -----------------------------------------------------------------------------
-# CORE PROCESS
-# -----------------------------------------------------------------------------
-def process_msg_file(msg_path: Path, variant: str) -> bool:
-    """
-    Process a single .msg file:
-      - Extract project code
-      - Create folders
-      - Copy reference files
-      - Save attachments
-    Returns True if processed successfully, False otherwise.
-    """
-    msg = None
-    try:
-        msg = extract_msg.Message(str(msg_path))
-        subject = msg.subject or "No Subject"
-        project_code = extract_project_code(subject, variant)
-
-        if not project_code:
-            print(f"⚠️  No match in: {subject}")
-            return False
-
-        project_folder = OUT_FOLDER / project_code
-        archive_folder = project_folder / "archive"
-
-        project_folder.mkdir(exist_ok=True)
-        archive_folder.mkdir(exist_ok=True)
-
-        # Copy reference files from refs/ if present
-        if REFS_FOLDER.exists():
-            for ref_file in REFS_FOLDER.iterdir():
-                if ref_file.is_file():
-                    dest = project_folder / ref_file.name
-                    if not dest.exists():
-                        shutil.copy2(ref_file, dest)
-
-        # Copy original .msg file into archive
-        msg_dest = dedupe_path(archive_folder / msg_path.name)
-        shutil.copy2(msg_path, msg_dest)
-
-        # Extract and save attachments
-        attachment_count = 0
-        for attachment in getattr(msg, "attachments", []) or []:
-            raw_name = (
-                getattr(attachment, "longFilename", None)
-                or getattr(attachment, "shortFilename", None)
-                or "attachment.bin"
-            )
-            safe_name = sanitize_filename(raw_name)
-            attachment_path = dedupe_path(project_folder / safe_name)
-            with open(attachment_path, "wb") as f:
-                f.write(attachment.data)
-            attachment_count += 1
-
-        print(f"✅ {project_code} ({attachment_count} attachments)")
-        return True
-
-    except Exception as e:
-        print(f"❌ Error processing {msg_path.name}: {e}")
-        return False
-    finally:
-        try:
-            if msg:
-                msg.close()
-        except:
-            pass
-
-
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
-def main():
-    """Main entry point — processes all .msg files in drop/ folder."""
-    for folder in [DROP_FOLDER, OUT_FOLDER, REFS_FOLDER, LOGS_FOLDER]:
-        folder.mkdir(exist_ok=True)
-
-    variant = VARIANTS.get(ACTIVE_VARIANT)
-    if not variant:
-        print(f"Variant '{ACTIVE_VARIANT}' not found in VARIANTS: {list(VARIANTS.keys())}")
-        return
-
-    print(f"{'='*60}")
-    print(f"Pytenberg v{__version__}")
-    print(f"{'='*60}")
-    print(f"Active variant: {ACTIVE_VARIANT}")
-    print(f"Drop folder:    {DROP_FOLDER}")
-    print(f"Output folder:  {OUT_FOLDER}")
-    print(f"{'='*60}\n")
-
-    msg_files = list(DROP_FOLDER.glob("*.msg"))
-    if not msg_files:
-        print("No .msg files found in drop/ folder.")
-        print("\n💡 Example: save a test email with a subject that fits your variant.")
-        print("   Drop it into 'drop/' and rerun this script.")
-        return
-
-    processed = failed = 0
-    for msg_file in msg_files:
-        if process_msg_file(msg_file, variant):
-            processed += 1
+def connect_gmail():
+    """OAuth login; creates token.json on first run."""
+    SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            failed += 1
+            if not os.path.exists('credentials.json'):
+                print("\n❌ Missing 'credentials.json' (create OAuth Desktop credentials in Google Cloud).")
+                print("   Place the file next to this script and rerun.\n")
+                return None
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.json', 'w') as f:
+            f.write(creds.to_json())
+    return build('gmail', 'v1', credentials=creds)
 
-    print(f"\n{'='*60}")
-    print(f"✅ Successfully processed: {processed}")
-    print(f"❌ Failed: {failed}")
-    print(f"📁 Output folder: {OUT_FOLDER}")
-    print(f"{'='*60}")
+def search_gmail(service, query, limit=50):
+    """Return list of message objects (id only) up to limit."""
+    msgs, token = [], None
+    while len(msgs) < limit:
+        resp = service.users().messages().list(
+            userId='me', q=query, maxResults=min(100, limit - len(msgs)),
+            pageToken=token
+        ).execute()
+        msgs.extend(resp.get('messages', []) or [])
+        token = resp.get('nextPageToken')
+        if not token: break
+    return msgs
 
+def get_headers(full_msg):
+    headers = full_msg.get('payload', {}).get('headers', [])
+    return {h['name'].lower(): h['value'] for h in headers}
+
+def get_raw_eml(service, msg_id) -> bytes:
+    raw = service.users().messages().get(userId='me', id=msg_id, format='raw').execute()['raw']
+    return base64.urlsafe_b64decode(raw.encode('utf-8'))
+
+def iter_parts(payload):
+    if not payload: return
+    yield payload
+    for p in payload.get('parts', []) or []:
+        yield from iter_parts(p)
+
+def load_ledger() -> set[str]:
+    """Read gmail_ledger.jsonl and return set of processed Gmail IDs."""
+    seen = set()
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    if LEDGER_FILE.exists():
+        with LEDGER_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    gid = rec.get("gmail_id")
+                    if gid: seen.add(gid)
+                except Exception:
+                    pass
+    return seen
+
+def append_ledger(gmail_id: str, subject: str, out_dir: Path):
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    with LEDGER_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "ts": dt.datetime.utcnow().isoformat() + "Z",
+            "gmail_id": gmail_id,
+            "subject": subject[:120],
+            "dir": str(out_dir)
+        }, ensure_ascii=False) + "\n")
+
+# ----------------- main -----------------
+def main():
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    ap = argparse.ArgumentParser(description="Pytenberg — Gmail to folders (standalone)")
+    ap.add_argument("--output-root", default=str(OUT_ROOT), help="Output directory root")
+    ap.add_argument("--query", default=None, help='Gmail search query (e.g., \'from:nytimes.com newer_than:7d\')')
+    ap.add_argument("--limit", type=int, default=50, help="Max emails to process")
+    ap.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    args = ap.parse_args()
+
+    print("☎️ Connecting to Gmail...")
+    svc = connect_gmail()
+    if not svc: return
+
+    banner()
+
+    if args.query:
+        query_text = args.query.strip()
+    else:
+        query_text = input("What do you want to search for? (e.g., insurance claim): ").strip()
+        if not query_text:
+            print("No search term entered."); return
+
+    # Safety: force inbox and exclude spam unless user already specified them
+    q_bits = [query_text]
+    if "in:" not in query_text:
+        q_bits.append("in:inbox")
+    if "-in:spam" not in query_text:
+        q_bits.append("-in:spam")
+    gmail_query = " ".join(q_bits)
+
+    print(f"\n🔍 Searching Gmail for: {gmail_query}")
+    msgs = search_gmail(svc, gmail_query, limit=args.limit)
+    print(f"📧 Found {len(msgs)} emails")
+    if not msgs:
+        print("\nNo emails found."); return
+
+    base_dir = Path(args.output_root) / sanitize_filename(re.sub(r"\s+", "_", query_text))
+    print(f"\n📁 Saving to: {base_dir}/\n")
+
+    seen = load_ledger()
+    processed = blocked = 0
+
+    for idx, m in enumerate(msgs, 1):
+        mid = m["id"]
+        if mid in seen and not args.dry_run:
+            print(f"⏭️  {idx}/{len(msgs)} already processed (ledger)")
+            continue
+
+        full = svc.users().messages().get(userId='me', id=mid, format='full').execute()
+        H = get_headers(full)
+        subject = H.get('subject', 'No Subject')
+        preview = (subject[:60] + "…") if len(subject) > 60 else subject
+
+        # Plan artifacts
+        email_dir  = base_dir / f"email_{idx:03d}"
+        eml_path   = email_dir / "email.eml"
+        attach_dir = email_dir / "attachments"
+
+        # Gather allowed attachments
+        allowed = []
+        for part in iter_parts(full.get('payload', {})):
+            fname = part.get('filename')
+            body  = part.get('body', {})
+            att_id = body.get('attachmentId')
+            if not fname or not att_id:
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in SAFE_EXT:
+                blocked += 1
+                print(f"🚫 {idx}/{len(msgs)} {preview}  (blocked type: {ext})")
+                continue
+            meta = svc.users().messages().attachments().get(userId='me', messageId=mid, id=att_id).execute()
+            data = meta.get('data', '')
+            blob = base64.urlsafe_b64decode(data.encode('utf-8')) if data else b''
+            if len(blob) > MAX_BYTES:
+                blocked += 1
+                print(f"🚫 {idx}/{len(msgs)} {preview}  (blocked size: {len(blob)} bytes)")
+                continue
+            allowed.append((fname, blob))
+
+        if args.dry_run:
+            print(f"✓ {idx}/{len(msgs)} {preview}  (attachments allowed: {len(allowed)}) [DRY]")
+            continue
+
+        # Write artifacts
+        email_dir.mkdir(parents=True, exist_ok=True)
+        with open(eml_path, "wb") as f:
+            f.write(get_raw_eml(svc, mid))
+        attach_dir.mkdir(exist_ok=True)
+        for fn, blob in allowed:
+            with open(attach_dir / sanitize_filename(fn), "wb") as f:
+                f.write(blob)
+
+        # Manifest
+        with open(email_dir / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "gmail_id": mid,
+                "subject": subject,
+                "from": H.get('from'),
+                "date": H.get('date'),
+                "attachments_saved": [sanitize_filename(a[0]) for a in allowed],
+                "dir": str(email_dir)
+            }, f, indent=2, ensure_ascii=False)
+
+        append_ledger(mid, subject, email_dir)
+        processed += 1
+        print(f"✓ {idx}/{len(msgs)} {preview}  (attachments: {len(allowed)}, blocked so far: {blocked})")
+
+    print("\n" + "="*70)
+    print("✅ COMPLETE")
+    print("="*70)
+    print(f"📊 Emails processed: {processed}")
+    print(f"🚫 Attachments blocked: {blocked}")
+    print(f"🧾 Ledger: {LEDGER_FILE}")
+    print(f"📁 Output root: {base_dir.parent}")
+    print("="*70 + "\n")
 
 if __name__ == "__main__":
     main()

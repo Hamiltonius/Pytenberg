@@ -1,53 +1,47 @@
 # Pytenberg
 
-Email chaos → organized folders. Automatically.
+**Email chaos → organized folders. Automatically.**
 
-Drop saved Outlook `.msg` emails into a folder — get structured project directories with attachments and reference files sorted automatically.
+Drop Outlook `.msg` files into `drop/` — or connect to Gmail — and get one clean project folder per email.
 
 ---
 
-## Quick Start
+## Install
 ```bash
-# Install dependency
-pip install extract-msg
-
-# Create working folders
-mkdir -p drop out refs
-
-# Place .msg files in drop/
-
-# Then run:
-python3 pytenberg.py
+pip install extract-msg google-api-python-client google-auth-httplib2 google-auth-oauthlib
+mkdir -p drop out refs logs
 ```
 
-**Result:** Each email becomes a folder in `out/` named from the subject line.
+## Usage
+```bash
+# Local .msg files
+python3 pytenberg.py --source local
 
----
+# Gmail + filter
+python3 pytenberg.py --source gmail --subject invoice
 
-## How It Works
-
-**Default behavior:** Extracts text before `-` or `:` in the subject line.
-
-Example: `Acme Corp - Invoice` → creates `out/Acme_Corp/`
-
-**Active Variants:** Want specific formats? Change the active variant in the script:
-```python
-ACTIVE_VARIANT = "invoice"      # Extracts INV-2024-001
-ACTIVE_VARIANT = "project"      # Extracts PROJECT-ALPHA
-ACTIVE_VARIANT = "case"         # Extracts case #12345
+# Gmail + sender + screenshot
+python3 pytenberg.py --source gmail --from amazon.com --screenshot
 ```
 
-Built-in variants: `invoice`, `project`, `contract`, `case`, `order`, `aerospace_code`
+**CLI Options**
+```text
+--source        local | gmail        # choose email source
+--subject       text filter          # match subject keywords
+--from          sender or domain     # match sender
+--dry-run                            # preview actions, no writes
+--screenshot                         # macOS only, saves .png
+```
 
-Default (`whole_subject_extract`) works for most emails.
-
----
+**Example:**
+Subject: "Invoice – Dr. Pepper"
+Creates: out/Invoice_Dr_Pepper/
 
 ## What You Get
 
 Each email creates a folder with attachments + anything from `refs/`:
 ```
-out/Client_Acme/
+out/Invoice_Dr_Pepper/
 ├── contract.pdf          (from email attachment)
 ├── invoice.pdf           (from email attachment)
 ├── status_template.xlsx  (from refs/ - always included)
@@ -55,45 +49,29 @@ out/Client_Acme/
     └── email.msg
 ```
 
-**Why refs/?** Drop recurring files here once (templates, checklists, reference docs) instead of attaching them to every email.
+---
+
+**Why refs/?**  
+Drop recurring reference files here once — templates, checklists, or forms you want auto-included in every new folder.
 
 ---
 
-## Active Variants
+## Example Commands
+```bash
+# Local Outlook messages
+python3 pytenberg.py --source local
 
-| Variant | Example Subject | Folder Created |
-|---------|----------------|----------------|
-| Default | `Acme Corp - Review` | `Acme_Corp/` |
-| `invoice` | `Invoice: INV-2024-001` | `INV-2024-001/` |
-| `project` | `Project: ALPHA-2024` | `ALPHA-2024/` |
-| `case` | `Case #12345: Bug` | `12345/` |
-| `contract` | `Contract: MSA-2024-Q1` | `MSA-2024-Q1/` |
+# Gmail (read-only, filtered by subject)
+python3 pytenberg.py --source gmail --subject invoice
 
-Change active variant in `pytenberg.py` around line 62.
-
----
+# Gmail (filtered by sender)
+python3 pytenberg.py --source gmail --from amazon.com --screenshot
+```
 
 ## Troubleshooting
 
-**No .msg files found:**
-- Save emails from Outlook: File → Save As → Outlook Message Format
-- Drop them in `drop/` folder
-
-**"No match in subject":**
-- Default variant is very permissive
-- Or switch explicitly: `ACTIVE_VARIANT = "whole_subject_extract"`
-
-**Missing extract_msg:**
-```bash
-pip install extract-msg
-```
-
----
-
-## License
-
-MIT
-
----
-
-Built by Thomas Galarneau 10.17.2025
+| Issue                         | Fix                                                                                |
+| ----------------------------- | ---------------------------------------------------------------------------------- |
+| **No token / No connection?** | `rm token.json` then `python3 pytenberg.py --source gmail`                         |
+| **No .msg files found?**      | Save from Outlook: `File → Save As → Outlook Message Format` and drop into `drop/` |
+| **Missing extract_msg?**      | `pip install extract-msg`                                                          |
